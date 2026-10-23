@@ -1,462 +1,379 @@
 """
-Select the features that differ between study groups (WT / NPC / EFV)
-=====================================================================
-Independent script: reads RESULTSNatalia/features_final.xlsx, tests every feature,
-and writes a new Excel with ONLY the selected features, in the same format, so the
-PCA / t-SNE / UMAP / k-means scripts can use it just by changing their EXCEL_PATH.
+Select the features that differ between study groups, ONE EXCEL PER COMPARISON
+==============================================================================
+The selection uses the SAME statistics as the group_comparison figures:
+it reads RESULTSNatalia/group_comparison/group_comparison_pvalues.csv (made by
+plot_group_comparison.py: one-way ANOVA of the 3 groups on sessions + Tukey-Kramer)
+and keeps, for each comparison, every feature that has a star in the figures:
 
-HOW EACH FEATURE IS TESTED (and why)
-------------------------------------
-1. Sessions of the same mouse are NOT independent (same electrode, same brain).
-   Treating 89 sessions as 89 independent mice makes p-values far too small
-   ("pseudoreplication"). So the main test is a LINEAR MIXED MODEL:
-        feature ~ group + (random effect of animal)
-   = "is there a group difference, taking into account that sessions of the
-   same mouse are similar?". p-value from a likelihood-ratio test with a
-   small-sample correction (F distribution with df = n_animals - n_groups),
-   because there are only ~16 mice.
-   Two other tests are also reported, for comparison:
-     - "animal":  Kruskal-Wallis on the MEDIAN of each mouse (16 values; safe but weak)
-     - "session": Kruskal-Wallis on all sessions (what the old MATLAB did; too optimistic)
-2. ~70 features are tested at once: by pure chance ~3-4 of them would give
-   p < 0.05 even with NO real difference. So p-values are corrected with the
-   False Discovery Rate (Benjamini-Hochberg) -> "q-value". By default a feature is
-   selected if q < ALPHA (SELECT_BY = "fdr"); "p" and "top" are looser options
-   for exploring.
-3. Some features are the same measurement summarized twice (mean and max of the
-   same band/layer/state; mean and median of the same CSD layer). With
-   REDUNDANCY = "twins" only the more significant of each pair is kept, while
-   every frequency band, layer and brain state stays separate.
-   Every feature also gets an "evidence" label: strong (q < 0.05),
-   moderate (q < 0.10), weak (only p < 0.05, not after correction).
-4. For each selected feature, pairwise tests (WT-NPC, WT-EFV, NPC-EFV) tell you
-   WHICH groups differ.
+    WT_vs_NPC         -> star in the WT-NPC bracket   (p_tukey_WT_vs_NPC  < ALPHA)
+    NPC_vs_EFV        -> star in the NPC-EFV bracket  (p_tukey_NPC_vs_EFV < ALPHA)
+    WT_vs_EFV         -> star in the WT-EFV bracket   (p_tukey_WT_vs_EFV  < ALPHA)
+    WT_vs_NPC_vs_EFV  -> a star in ANY of the three brackets
 
-!! IMPORTANT: selecting features with the group labels and then looking at PCA /
-clusters is partly CIRCULAR: the groups will separate better *because* we chose
-features that separate them. Fine for exploring and describing, but for the final
-machine-learning model the selection must be repeated INSIDE the cross-validation.
+Every frequency band, layer and brain state is kept separately. Two settings decide
+what happens with mean and max of the same band/layer/state (and mean and median of
+the same CSD layer), which are the same measurement summarized twice:
+    KEEP_BOTH = True  -> every feature with a star is kept, mean AND max (default)
+    KEEP_BOTH = False -> only one of them: the mean when both have a star, the max
+                         (or the CSD median) when only that one has a star
+    USE_MAX = False   -> the max of power is never selected (only the mean)
+The CSD std is a different measurement (ripple-to-ripple variability), so it is
+always treated on its own.
 
-OUTPUT (RESULTSNatalia/feature_selection/)
-  feature_tests.xlsx        every feature: group medians, p-values, q-values, selected?
-  features_selected.xlsx    animal, session, group + selected features (sheet "features")
-  01_significance.png       -log10(q) of every feature, by family
-  02_selected_features.png  boxplots of the selected features by group
+ORDER OF THE SCRIPTS (every time features_final changes, e.g. new mice):
+    1. build_feature_table.py     -> features_final.xlsx / .csv
+    2. plot_group_comparison.py   -> figures + group_comparison_pvalues.csv
+    3. select_features.py         -> this script
+If group_comparison_pvalues.csv is OLDER than features_final, this script stops and
+tells you to run plot_group_comparison.py first (CHECK_DATES = True).
+
+!! IMPORTANT: the figures' test treats sessions as independent, so it finds more
+differences than a test per mouse would (some will be false positives). That is fine
+for an exploratory selection; for the honest accuracy of the models, the selection
+is repeated INSIDE the cross-validation.
+
+THE SAME RULE INSIDE THE MODELS (no leakage)
+select_in_fold() applies exactly this rule, but recomputing the ANOVA + Tukey only on the
+sessions it is given (e.g. all the mice except the one hidden in a fold).
+feature_stability.py and the classifiers import it from here, so this file must stay in
+the same folder as them. Running this script is not affected by it.
+
+INPUT : RESULTSNatalia/features_final.xlsx (sheet "features")
+        RESULTSNatalia/group_comparison/group_comparison_pvalues.csv
+OUTPUT: RESULTSNatalia/feature_selection/, one set per comparison <C>:
+        features_selected_<C>.xlsx   animal, session, group + selected features
+                                     (sheet "features"; only the sessions of the
+                                     groups of that comparison)
+        feature_tests_<C>.xlsx       every feature: p-values, star, selected or why not,
+                                     + sheet "settings" with the settings of this run
+        The OLD features_selected.xlsx (used by PCA / t-SNE / k-means) is never touched.
 """
 
 import re
-import warnings
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
-from scipy.stats import chi2, kruskal, spearmanr
-from scipy.stats import f as f_dist
 
 # =============================================================================
 # SETTINGS
 # =============================================================================
 baseDir = Path(r"D:\Violeta\ANALISIS")
 RESULTS_DIR = baseDir / "RESULTSNatalia"
-EXCEL_PATH = RESULTS_DIR / "features_final.xlsx"
+FEATURES_EXCEL = RESULTS_DIR / "features_final.xlsx"
+FEATURES_CSV = RESULTS_DIR / "features_final.csv"       # only used for the date check
 SHEET = "features"
+PVALUES_CSV = RESULTS_DIR / "group_comparison" / "group_comparison_pvalues.csv"
 OUTPUT_DIR = RESULTS_DIR / "feature_selection"
 
+# Comparisons to run, one after the other (each one writes its own files).
+COMPARISONS_TO_RUN = ["WT_vs_NPC", "NPC_vs_EFV", "WT_vs_EFV", "WT_vs_NPC_vs_EFV"]
+
+KEEP_BOTH = True     # True  = keep EVERY feature with a star: mean AND max (and CSD mean AND
+                     #         median) are both kept when both have a star
+                     # False = only one per measurement (the mean when both have a star)
+USE_MAX = True       # True  = the max of power can be selected
+                     # False = the max of power is never selected (only the mean)
+                     # (feature_stability.py and the classifiers use these same settings)
+ALPHA = 0.05         # a "star" = Tukey p < ALPHA (the same as in the figures)
+CHECK_DATES = True   # stop if group_comparison_pvalues.csv is older than features_final
+# =============================================================================
+
+# groups of each comparison + the Tukey columns of group_comparison_pvalues.csv it uses
+COMPARISONS = {
+    "WT_vs_NPC": (["WT", "NPC"], ["p_tukey_WT_vs_NPC"]),
+    "NPC_vs_EFV": (["NPC", "EFV"], ["p_tukey_NPC_vs_EFV"]),
+    "WT_vs_EFV": (["WT", "EFV"], ["p_tukey_WT_vs_EFV"]),
+    "WT_vs_NPC_vs_EFV": (["WT", "NPC", "EFV"],
+                         ["p_tukey_WT_vs_NPC", "p_tukey_WT_vs_EFV", "p_tukey_NPC_vs_EFV"]),
+}
 ID_COLS = ["animal", "session", "group"]
-GROUPS = ["WT", "NPC", "EFV"]
-# not biological features (same rule as PCA_analysis.py)
+# columns of features_final that are not biological features (same rule as the models)
 EXCLUDE_PREFIXES = ["ch_", "config_", "power_pyr_channel", "power_slm_channel",
                     "power_channels_match", "n_"]
 EXCLUDE_SUFFIXES = ["_n"]
-
-TEST = "mixed"            # test used to SELECT: "mixed" (recommended), "animal" or "session"
-SELECT_BY = "p"           # "p":   p-value < ALPHA  (screening: keeps every feature with a hint
-                          #        of a group difference; some may be false positives)
-                          # "fdr": q-value < ALPHA  (strict: only differences you can claim)
-                          # "top": the TOP_N features with the smallest p
-ALPHA = 0.05
-TOP_N = 10
-LOG_POWER = True          # test log(power): power values are very skewed
-REDUNDANCY = "twins"      # "twins": only merge the SAME measurement summarized twice
-                          #   (mean/max of one band+layer+state; mean/median of one CSD layer).
-                          #   Every frequency band, layer and state is KEPT separately.
-                          # "correlation": also merge any features with |r| > CORR_THRESHOLD
-                          #   (can remove different bands/layers that move together!)
-                          # "none": keep everything that passes the test
-CORR_THRESHOLD = 0.90
-EXCLUDE_ODD_SESSIONS = False   # True = leave out the odd sessions listed below
-# The 11 odd sessions (flattened CSD + weak SLM power; see compare_odd_sessions.py).
-# Edit this list if you decide to add or remove sessions.
-ODD_SESSIONS = {
-    "EFV_218": ["2026-01-16_17-50-35"],
-    "EFV_220": ["2026-01-13_14-12-19", "2026-01-13_15-18-23", "2026-01-15_18-37-42"],
-    "EFV_277": ["2026-02-20_12-02-47"],
-    "NPC_249": ["2026-02-04_16-01-16", "2026-02-05_16-14-02", "2026-02-05_16-40-43"],
-    "NPC_29":  ["P-7"],
-    "NPC_30":  ["P4-HI"],
-    "NPC_47":  ["P3-HD"],
-}
-N_PLOT = 24               # selected features shown as boxplots
-GROUP_COLORS = {"WT": "#1f77b4", "NPC": "#d62728", "EFV": "#2ca02c"}
-# =============================================================================
-
-POWER_RE = re.compile(r"^(Delta|Theta|Alpha|SlowGamma|MidGamma|FastGamma|Ripple)_(PYR|SLM)_(Theta|LIA)_(mean|max)$",
-                      re.IGNORECASE)
+# when two summaries of the same measurement both have a star, the first one in this list wins
+PREFERENCE = ["mean", "median", "max"]
 
 
-def family(name):
-    if POWER_RE.match(name):
-        return "power"
-    if name.upper().startswith("CSD_"):
-        return "CSD"
-    if name.lower().startswith("ripple_"):
-        return "ripple"
-    return "other"
+def twin_key(feature):
+    """Features with the same key are the same measurement summarized differently
+    (power: mean / max of one band+layer+state; CSD: mean / median of one layer).
+    CSD std and the ripple features have their own key."""
+    m = re.match(r"^(.+)_(mean|max)$", feature)
+    if m and not feature.startswith(("CSD_", "ripple_")):
+        return m.group(1)
+    m = re.match(r"^(CSD_[A-Za-z]+)_(mean|median)$", feature)
+    if m:
+        return m.group(1)
+    return feature
+
+
+def summary_of(feature):
+    m = re.search(r"_(mean|median|max)$", feature)
+    return m.group(1) if m else ""
+
+
+def star_text(p):
+    if pd.isna(p) or p >= ALPHA:
+        return ""
+    return "***" if p < 0.001 else "**" if p < 0.01 else "*"
 
 
 # -----------------------------------------------------------------------------
-# Linear mixed model with a random intercept per animal (fitted by maximum
-# likelihood). Written here so no extra package (statsmodels) is needed.
+# THE SELECTION RULE (used here AND inside every fold of feature_stability.py and
+# the classifiers, so all of them choose features in exactly the same way)
 # -----------------------------------------------------------------------------
-def _mixed_loglik(y, X, animal_idx):
-    """Max log-likelihood of y = X b + u_animal + e, u ~ N(0, t2), e ~ N(0, s2)."""
-    blocks = [np.where(animal_idx == a)[0] for a in np.unique(animal_idx)]
-
-    def negll(theta):
-        s2, t2 = np.exp(theta)
-        XtVX = np.zeros((X.shape[1], X.shape[1]))
-        XtVy = np.zeros(X.shape[1])
-        logdet = 0.0
-        parts = []
-        for b in blocks:
-            n = len(b)
-            c = t2 / (s2 + n * t2)          # V^-1 = (I - c 11') / s2
-            Xb, yb = X[b], y[b]
-            sx, sy = Xb.sum(0), yb.sum()
-            XtVX += (Xb.T @ Xb - c * np.outer(sx, sx)) / s2
-            XtVy += (Xb.T @ yb - c * sx * sy) / s2
-            logdet += (n - 1) * np.log(s2) + np.log(s2 + n * t2)
-            parts.append((Xb, yb, c))
-        beta = np.linalg.solve(XtVX, XtVy)
-        quad = 0.0
-        for Xb, yb, c in parts:
-            r = yb - Xb @ beta
-            quad += (r @ r - c * r.sum() ** 2) / s2
-        return 0.5 * (logdet + quad + len(y) * np.log(2 * np.pi))
-
-    best = None
-    for start in ([0.0, -1.0], [-1.0, 0.0], [0.0, -6.0]):
-        res = minimize(negll, start, method="L-BFGS-B", bounds=[(-12, 6), (-18, 6)])
-        if best is None or res.fun < best.fun:
-            best = res
-    return -best.fun
-
-
-def mixed_lrt(y, groups, animals):
-    """p-value of 'group' in y ~ group + (1|animal), likelihood-ratio test."""
-    y = np.asarray(y, float)
-    ok = ~np.isnan(y)
-    y, groups, animals = y[ok], np.asarray(groups)[ok], np.asarray(animals)[ok]
-    levels = [g for g in pd.unique(groups)]
-    if len(levels) < 2 or np.nanstd(y) == 0:
-        return np.nan
-    y = (y - y.mean()) / y.std()
-    a_idx = pd.factorize(animals)[0]
-    X0 = np.ones((len(y), 1))
-    X1 = np.column_stack([X0] + [(groups == g).astype(float) for g in levels[1:]])
-    try:
-        lr = 2 * (_mixed_loglik(y, X1, a_idx) - _mixed_loglik(y, X0, a_idx))
-    except np.linalg.LinAlgError:
-        return np.nan
-    # Small-sample correction: with only ~16 mice the plain chi-square test is too
-    # optimistic. Compare LR/df1 with an F distribution whose 2nd df = number of
-    # animals - number of groups (the real amount of independent information).
-    df1 = len(levels) - 1
-    df2 = len(np.unique(a_idx)) - len(levels)
-    if df2 < 1:
-        return float(chi2.sf(max(lr, 0.0), df=df1))
-    return float(f_dist.sf(max(lr, 0.0) / df1, df1, df2))
-
-
-def kw(values, groups):
-    samples = [values[groups == g] for g in pd.unique(groups)]
-    samples = [s[~np.isnan(s)] for s in samples]
-    samples = [s for s in samples if len(s) > 0]
-    if len(samples) < 2 or np.nanstd(np.concatenate(samples)) == 0:
-        return np.nan
-    return float(kruskal(*samples).pvalue)
-
-
-def bh_fdr(p):
-    """Benjamini-Hochberg q-values (NaN stays NaN)."""
-    p = np.asarray(p, float)
-    q = np.full_like(p, np.nan)
-    ok = ~np.isnan(p)
-    pv = p[ok]
-    n = len(pv)
-    if n == 0:
-        return q
-    order = np.argsort(pv)
-    ranked = pv[order] * n / np.arange(1, n + 1)
-    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
-    out = np.empty(n)
-    out[order] = np.minimum(ranked, 1)
-    q[ok] = out
-    return q
-
-
-def twin_key(name):
-    """Features with the same key are the same measurement summarized differently."""
-    m = POWER_RE.match(name)
-    if m:                                   # band, layer, state  (mean / max are twins)
-        return ("power", m.group(1).lower(), m.group(2).upper(), m.group(3).lower())
-    m = re.match(r"^CSD_([A-Za-z]+)_(mean|median|std)$", name, re.IGNORECASE)
-    if m:                                   # mean / median are twins, std is different
-        kind = "spread" if m.group(2).lower() == "std" else "centre"
-        return ("CSD", m.group(1).upper(), kind)
-    return (name,)
-
-
-def cohen_d(a, b):
-    a, b = a[~np.isnan(a)], b[~np.isnan(b)]
-    if len(a) < 2 or len(b) < 2:
-        return np.nan
-    sp = np.sqrt(((len(a) - 1) * a.var(ddof=1) + (len(b) - 1) * b.var(ddof=1)) / (len(a) + len(b) - 2))
-    return (a.mean() - b.mean()) / sp if sp > 0 else np.nan
-
-
-# -----------------------------------------------------------------------------
-def load():
-    df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET)
-    df = df[df["group"].astype(str).isin(GROUPS)].reset_index(drop=True)
-
-    if EXCLUDE_ODD_SESSIONS:
-        wanted = {f"{a.strip()}|{s.strip()}" for a, ss in ODD_SESSIONS.items() for s in ss}
-        key = (df["animal"].astype(str).str.strip() + "|" + df["session"].astype(str).str.strip())
-        found = set(key[key.isin(wanted)])
-        print(f"[i] EXCLUDE_ODD_SESSIONS = True: leaving out {len(found)} of the {len(wanted)} listed odd sessions")
-        for k in sorted(wanted - found):
-            print(f"    [!] not found in the Excel (check the name): {k.replace('|', '  ')}")
-        df = df[~key.isin(wanted)].reset_index(drop=True)
+def decide(res, use_max=None, keep_both=None):
+    """res: table with columns feature, summary, p_used, star (one row per feature).
+    Adds 'selected' and 'reason' following the rule: a star -> candidate; with keep_both
+    every candidate is kept; otherwise mean/max (and mean/median for CSD) of the same
+    measurement -> only one is kept (PREFERENCE order). With use_max False the power max
+    is never selected."""
+    use_max = USE_MAX if use_max is None else use_max
+    keep_both = KEEP_BOTH if keep_both is None else keep_both
+    res = res.copy()
+    res["selected"] = False
+    res["reason"] = ""
+    res.loc[res["star"] == "", "reason"] = "no star"
+    if not use_max:
+        is_max = (res["summary"] == "max") & ~res["feature"].str.startswith(("CSD_", "ripple_"))
+        res.loc[is_max & (res["star"] != ""), "reason"] = "max not used (USE_MAX = False)"
+        candidates = res[(res["star"] != "") & ~is_max]
     else:
-        print("[i] EXCLUDE_ODD_SESSIONS = False: using ALL sessions")
+        candidates = res[res["star"] != ""]
 
-    cand = [c for c in df.columns if c not in ID_COLS
-            and not c.startswith(tuple(EXCLUDE_PREFIXES)) and not c.endswith(tuple(EXCLUDE_SUFFIXES))]
-    feats = df[cand].apply(pd.to_numeric, errors="coerce")
-    feats = feats.loc[:, feats.notna().sum() >= 10]                 # enough data
-    feats = feats.loc[:, feats.std(skipna=True) > 0]                # not constant
-    return df, feats
+    if keep_both:                     # every feature with a star is kept
+        res.loc[candidates.index, "selected"] = True
+        res.loc[candidates.index, "reason"] = "selected"
+        return res
+
+    for key, grp in candidates.groupby(candidates["feature"].map(twin_key), sort=False):
+        order = sorted(grp.index, key=lambda i: PREFERENCE.index(res.at[i, "summary"])
+                       if res.at[i, "summary"] in PREFERENCE else -1)
+        winner = order[0]
+        res.at[winner, "selected"] = True
+        res.at[winner, "reason"] = "selected"
+        for i in order[1:]:
+            res.at[i, "reason"] = f"same measurement as {res.at[winner, 'feature']} (kept that one)"
+    return res
+
+
+def plotted_features(columns):
+    """The features that have a figure in plot_group_comparison.py (same list, same order):
+    power {Band}_{PYR|SLM}_{Theta|LIA}_{mean,max}, CSD_{layer}_{mean,median,std},
+    ripple frequency / amplitude / power."""
+    cols = list(columns)
+    out = []
+    for c in cols:
+        m = re.match(r"^([A-Za-z]+)_(PYR|SLM)_(Theta|LIA)_mean$", c)
+        if m:
+            out += [f for f in (c, c[:-len("mean")] + "max") if f in cols]
+    for layer in ("SO", "PYR", "RAD", "SLM"):
+        out += [f for f in (f"CSD_{layer}_mean", f"CSD_{layer}_median", f"CSD_{layer}_std") if f in cols]
+    out += [f for f in ("ripple_frequency_mean", "ripple_amplitude_mean", "ripple_power_mean") if f in cols]
+    return out
+
+
+def tukey_table(df):
+    """The same statistics as plot_group_comparison.py (one-way ANOVA of WT, NPC, EFV on
+    sessions + Tukey-Kramer, raw values, NaN ignored), computed on the sessions in df.
+    Returns one row per feature with p_tukey_WT_vs_NPC, p_tukey_WT_vs_EFV, p_tukey_NPC_vs_EFV."""
+    from itertools import combinations
+    from scipy.stats import tukey_hsd
+    rows = []
+    groups = df["group"].to_numpy()
+    for f in plotted_features(df.columns):
+        x = pd.to_numeric(df[f], errors="coerce").to_numpy(float)
+        names = [g for g in ("WT", "NPC", "EFV") if np.any((groups == g) & ~np.isnan(x))]
+        arrays = [x[(groups == g) & ~np.isnan(x)] for g in names]
+        row = {"feature": f}
+        if len(names) >= 2 and np.ptp(np.concatenate(arrays)) > 0:
+            try:
+                res = tukey_hsd(*arrays)
+                for i, j in combinations(range(len(names)), 2):
+                    row[f"p_tukey_{names[i]}_vs_{names[j]}"] = float(res.pvalue[i, j])
+            except ValueError:
+                pass
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for c in ("p_tukey_WT_vs_NPC", "p_tukey_WT_vs_EFV", "p_tukey_NPC_vs_EFV"):
+        if c not in out:
+            out[c] = np.nan
+    return out
+
+
+_Q_CRIT = {}
+
+
+def _q_crit(k, dof):
+    """Critical value of the studentized range for p = ALPHA (computed once per k, dof)."""
+    from scipy.stats import studentized_range
+    key = (k, dof, ALPHA)
+    if key not in _Q_CRIT:
+        _Q_CRIT[key] = float(studentized_range.ppf(1 - ALPHA, k, dof))
+    return _Q_CRIT[key]
+
+
+def star_table(df):
+    """FAST version of tukey_table for the selection inside the folds: same ANOVA + Tukey-Kramer,
+    but instead of the (slow) exact p-value it compares each Tukey statistic with the critical
+    value for p = ALPHA. The decision "p < ALPHA" is exactly the same.
+    Returns one row per feature with True/False columns star_WT_vs_NPC, star_WT_vs_EFV,
+    star_NPC_vs_EFV and q_<pair> (the Tukey statistic; bigger = more different)."""
+    from itertools import combinations
+    groups = df["group"].to_numpy()
+    rows = []
+    for f in plotted_features(df.columns):
+        x = pd.to_numeric(df[f], errors="coerce").to_numpy(float)
+        names = [g for g in ("WT", "NPC", "EFV") if np.any((groups == g) & ~np.isnan(x))]
+        arrays = [x[(groups == g) & ~np.isnan(x)] for g in names]
+        row = {"feature": f}
+        n_tot, k = sum(len(a) for a in arrays), len(names)
+        if k >= 2 and n_tot > k and np.ptp(np.concatenate(arrays)) > 0:
+            dof = n_tot - k
+            mse = sum(((a - a.mean()) ** 2).sum() for a in arrays) / dof
+            qc = _q_crit(k, dof)
+            for i, j in combinations(range(k), 2):
+                a, b = arrays[i], arrays[j]
+                q = abs(a.mean() - b.mean()) / np.sqrt(mse / 2 * (1 / len(a) + 1 / len(b)))
+                row[f"q_{names[i]}_vs_{names[j]}"] = q
+                row[f"star_{names[i]}_vs_{names[j]}"] = q > qc
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for pair in ("WT_vs_NPC", "WT_vs_EFV", "NPC_vs_EFV"):
+        if f"q_{pair}" not in out:
+            out[f"q_{pair}"] = np.nan
+        if f"star_{pair}" not in out:
+            out[f"star_{pair}"] = False
+        out[f"star_{pair}"] = out[f"star_{pair}"].fillna(False).astype(bool)
+    return out
+
+
+def select_in_fold(df_train, comparison, use_max=None, keep_both=None):
+    """The selection of select_features.py, but computed ONLY on the sessions of df_train
+    (e.g. every mouse except the hidden one). Option A: the Tukey test uses the three groups
+    that are in df_train, and the star of the comparison is taken from it.
+    Returns the list of selected features (never empty: if no feature has a star, the one
+    with the largest Tukey statistic is returned, so a model can still be trained)."""
+    pairs = [c.replace("p_tukey_", "") for c in COMPARISONS[comparison][1]]
+    st = star_table(df_train)
+    res = st[["feature"]].copy()
+    res["summary"] = res["feature"].map(summary_of)
+    res["star"] = np.where(st[[f"star_{p}" for p in pairs]].any(axis=1), "*", "")
+    res = decide(res, use_max, keep_both)
+    kept = list(res.loc[res["selected"], "feature"])
+    if not kept:
+        q = st[[f"q_{p}" for p in pairs]].max(axis=1)
+        if q.notna().any():
+            kept = [st.loc[q.idxmax(), "feature"]]
+    return kept
+
+
+# -----------------------------------------------------------------------------
+def check_inputs():
+    for f in (FEATURES_EXCEL, PVALUES_CSV):
+        if not f.exists():
+            raise SystemExit(f"[!] File not found: {f}")
+    if CHECK_DATES:
+        features_time = max(f.stat().st_mtime for f in (FEATURES_EXCEL, FEATURES_CSV) if f.exists())
+        if PVALUES_CSV.stat().st_mtime < features_time:
+            raise SystemExit(
+                f"[!] {PVALUES_CSV.name} is OLDER than features_final: the p-values may not match\n"
+                f"    the current data. Run plot_group_comparison.py first, then this script again.\n"
+                f"    (To skip this check, set CHECK_DATES = False.)")
+
+
+def load():
+    df = pd.read_excel(FEATURES_EXCEL, sheet_name=SHEET)
+    df["group"] = df["group"].astype(str).str.strip()
+    df["animal"] = df["animal"].astype(str).str.strip()
+    pv = pd.read_csv(PVALUES_CSV)
+
+    # features of the table that have no figure (they can never be selected)
+    feats = [c for c in df.columns if c not in ID_COLS
+             and not c.startswith(tuple(EXCLUDE_PREFIXES)) and not c.endswith(tuple(EXCLUDE_SUFFIXES))]
+    no_figure = [c for c in feats if c not in set(pv["feature"])]
+    missing = [c for c in pv["feature"] if c not in df.columns]
+    if no_figure:
+        print(f"[i] {len(no_figure)} feature(s) of features_final have no figure in group_comparison, "
+              f"so they cannot be selected: {', '.join(no_figure)}")
+    if missing:
+        print(f"[!] {len(missing)} feature(s) of the csv are not in features_final (ignored): {', '.join(missing)}")
+        pv = pv[~pv["feature"].isin(missing)]
+    return df, pv.reset_index(drop=True)
+
+
+def run_comparison(name, df, pv):
+    groups, pcols = COMPARISONS[name]
+    res = pv[["figure", "feature"]].copy()
+    res["summary"] = res["feature"].map(summary_of)
+    res["p_used"] = pv[pcols].min(axis=1)                    # for 3 groups: the best bracket
+    res["star"] = res["p_used"].map(star_text)
+    for c in ["p_anova", "kw_p", "p_tukey_WT_vs_NPC", "p_tukey_WT_vs_EFV", "p_tukey_NPC_vs_EFV"]:
+        res[c] = pv[c]
+    for g in groups:
+        res[f"n_{g}"] = pv[f"n_{g}"]
+        res[f"mean_{g}"] = pv[f"mean_{g}"]
+
+    # ---- decide feature by feature (the rule lives in decide()) ----
+    res = decide(res)
+    kept = list(res.loc[res["selected"], "feature"])
+
+    # ---- report ----
+    print(f"Features with a star: {int((res['star'] != '').sum())} of {len(res)} | selected: {len(kept)}")
+    for fam, prefix in (("ripple", "ripple_"), ("CSD", "CSD_")):
+        sel = [f for f in kept if f.startswith(prefix)]
+        if sel:
+            print(f"  {fam:7s}: {', '.join(sel)}")
+    power = [f for f in kept if not f.startswith(("ripple_", "CSD_"))]
+    if power:
+        print(f"  power  : {', '.join(power)}")
+
+    # ---- save ----
+    sessions = df[df["group"].isin(groups)].reset_index(drop=True)
+    n_anim = sessions.groupby("group")["animal"].nunique().reindex(groups)
+    sel_file = OUTPUT_DIR / f"features_selected_{name}.xlsx"
+    tests_file = OUTPUT_DIR / f"feature_tests_{name}.xlsx"
+    if kept:
+        sessions[ID_COLS + kept].to_excel(sel_file, sheet_name="features", index=False)
+        print(f"  -> {sel_file.name}: {len(sessions)} sessions, {len(kept)} features")
+    else:
+        if sel_file.exists():
+            sel_file.unlink()   # don't leave an old list that no longer matches
+        print(f"  [!] no feature with a star: {sel_file.name} NOT written")
+
+    res = res.sort_values(["selected", "p_used"], ascending=[False, True])
+    with pd.ExcelWriter(tests_file) as w:
+        res.to_excel(w, sheet_name="all_features", index=False)
+        pd.DataFrame({
+            "setting": ["COMPARISON", "groups", "Tukey column(s) used", "KEEP_BOTH", "USE_MAX", "ALPHA",
+                        "p-values file", "p-values file date", "sessions", "animals per group",
+                        "features selected"],
+            "value": [name, ", ".join(groups), ", ".join(pcols), KEEP_BOTH, USE_MAX, ALPHA,
+                      str(PVALUES_CSV),
+                      pd.Timestamp(PVALUES_CSV.stat().st_mtime, unit="s").strftime("%Y-%m-%d %H:%M"),
+                      len(sessions), str(n_anim.to_dict()), len(kept)],
+        }).to_excel(w, sheet_name="settings", index=False)
+
+    return {"comparison": name, "sessions": len(sessions),
+            "animals": ", ".join(f"{g} {n}" for g, n in n_anim.items()),
+            "with_star": int((res["star"] != "").sum()), "selected": len(kept)}
 
 
 def main():
+    check_inputs()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    df, feats = load()
-    groups = df["group"].astype(str).to_numpy()
-    animals = df["animal"].astype(str).to_numpy()
-    n_anim = df.groupby("group")["animal"].nunique().reindex(GROUPS)
-    print(f"{len(df)} sessions, {feats.shape[1]} features | animals per group: {n_anim.to_dict()}")
-    rule = {"fdr": f"q < {ALPHA}", "p": f"p < {ALPHA} (no correction)", "top": f"top {TOP_N} by p"}[SELECT_BY]
-    print(f"Selecting with test = '{TEST}', rule: {rule}\n")
-
-    rows = []
-    for i, f in enumerate(feats.columns, 1):
-        x = feats[f].to_numpy(float)
-        if LOG_POWER and family(f) == "power" and np.nanmin(x) > 0:
-            x_test, transf = np.log10(x), "log10"
-        else:
-            x_test, transf = x, ""
-
-        # per-animal medians for the "animal" test
-        per_animal = (pd.DataFrame({"x": x_test, "g": groups, "a": animals})
-                      .groupby(["a", "g"])["x"].median().reset_index())
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            r = {
-                "feature": f, "family": family(f), "tested_as": transf,
-                **{f"median_{g}": np.nanmedian(x[groups == g]) for g in GROUPS},
-                "p_mixed": mixed_lrt(x_test, groups, animals),
-                "p_animal": kw(per_animal["x"].to_numpy(), per_animal["g"].to_numpy()),
-                "p_session": kw(x_test, groups),
-            }
-        rows.append(r)
-        print(f"\r  testing {i}/{feats.shape[1]}", end="")
-    print()
-
-    res = pd.DataFrame(rows)
-    for t in ("mixed", "animal", "session"):
-        res[f"q_{t}"] = bh_fdr(res[f"p_{t}"])
-    res = res.sort_values(f"p_{TEST}").reset_index(drop=True)
-    if SELECT_BY == "fdr":
-        res["significant"] = res[f"q_{TEST}"] < ALPHA
-    elif SELECT_BY == "p":
-        res["significant"] = res[f"p_{TEST}"] < ALPHA
-    else:
-        res["significant"] = res.index < TOP_N
-
-    # ---- pairwise comparisons (only for significant features) ----
-    pairs = [("WT", "NPC"), ("WT", "EFV"), ("NPC", "EFV")]
-    for a, b in pairs:
-        res[f"p_{a}_vs_{b}"] = np.nan
-        res[f"d_{a}_vs_{b}"] = np.nan
-    for idx, r in res[res["significant"]].iterrows():
-        x = feats[r["feature"]].to_numpy(float)
-        if r["tested_as"] == "log10":
-            x = np.log10(x)
-        for a, b in pairs:
-            m = np.isin(groups, [a, b])
-            if TEST == "mixed":
-                p = mixed_lrt(x[m], groups[m], animals[m])
-            elif TEST == "animal":
-                pa = pd.DataFrame({"x": x[m], "g": groups[m], "a": animals[m]}).groupby(["a", "g"])["x"].median().reset_index()
-                p = kw(pa["x"].to_numpy(), pa["g"].to_numpy())
-            else:
-                p = kw(x[m], groups[m])
-            res.loc[idx, f"p_{a}_vs_{b}"] = p
-            res.loc[idx, f"d_{a}_vs_{b}"] = cohen_d(x[groups == a], x[groups == b])
-
-    # ---- redundancy among significant features ----
-    res["redundant_with"] = ""
-    kept = []
-    for idx, r in res[res["significant"]].iterrows():      # most significant first
-        f = r["feature"]
-        twin = None
-        if REDUNDANCY in ("twins", "correlation"):
-            twin = next((k for k in kept if twin_key(k) == twin_key(f)), None)
-        if twin is None and REDUNDANCY == "correlation":
-            for k in kept:
-                rho = spearmanr(feats[f], feats[k], nan_policy="omit").correlation
-                if abs(rho) > CORR_THRESHOLD:
-                    twin = k
-                    break
-        if twin is None:
-            kept.append(f)
-        else:
-            res.loc[idx, "redundant_with"] = twin
-    res["selected"] = res["feature"].isin(kept)
-    q = res[f"q_{TEST}"]
-    res["evidence"] = np.select([q < 0.05, q < 0.10, res[f"p_{TEST}"] < 0.05],
-                                ["strong", "moderate", "weak"], default="")
-
-    # ---- report ----
-    n_sig = int(res["significant"].sum())
-    print("\nTOP 10 features by p-value (whether selected or not):")
-    print(res[["feature", "family", f"p_{TEST}", f"q_{TEST}", "significant"]].head(10)
-          .to_string(index=False, float_format=lambda v: f"{v:.3g}"))
-    print(f"\nPassing the rule: {n_sig} of {len(res)}")
-    print(f"Selected after merging twins (REDUNDANCY = '{REDUNDANCY}'): {len(kept)}")
-    print("Evidence of the selected ones: " +
-          ", ".join(f"{k} {v}" for k, v in res.loc[res["selected"], "evidence"].value_counts().items()))
-    print("By family (significant / tested):")
-    print(res.groupby("family")["significant"].agg(["sum", "count"]).to_string())
-    print(f"\nNumber of features with q < {ALPHA} / p < {ALPHA} for each test (to compare):")
-    for t in ("mixed", "animal", "session"):
-        print(f"  {t:8s}: {int((res[f'q_{t}'] < ALPHA).sum()):3d} / {int((res[f'p_{t}'] < ALPHA).sum()):3d}"
-              + ("   <- too optimistic: treats sessions of a mouse as independent" if t == "session" else ""))
-    if kept:
-        cols = ["feature", f"p_{TEST}", f"q_{TEST}", "evidence"] + [f"median_{g}" for g in GROUPS] + \
-               [f"p_{a}_vs_{b}" for a, b in pairs]
-        for fam in ("ripple", "CSD", "power", "other"):
-            sel = res[res["selected"] & (res["family"] == fam)]
-            if len(sel):
-                print(f"\nSELECTED {fam.upper()} FEATURES ({len(sel)}):")
-                print(sel[cols].to_string(index=False, float_format=lambda v: f"{v:.3g}"))
-        print_power_map(res)
-
-    with pd.ExcelWriter(OUTPUT_DIR / "feature_tests.xlsx") as w:
-        res.to_excel(w, sheet_name="all_features", index=False)
-        pd.DataFrame({"setting": ["TEST", "SELECT_BY", "ALPHA", "TOP_N", "LOG_POWER", "REDUNDANCY",
-                                  "CORR_THRESHOLD", "EXCLUDE_ODD_SESSIONS", "n_sessions"],
-                      "value": [TEST, SELECT_BY, ALPHA, TOP_N, LOG_POWER, REDUNDANCY,
-                                CORR_THRESHOLD, EXCLUDE_ODD_SESSIONS, len(df)]}
-                     ).to_excel(w, sheet_name="settings", index=False)
-
-    if len(kept) >= 2:
-        out = pd.concat([df[ID_COLS], feats[kept]], axis=1)
-        out.to_excel(OUTPUT_DIR / "features_selected.xlsx", sheet_name="features", index=False)
-        print(f"\nfeatures_selected.xlsx written with {len(kept)} features")
-    else:
-        print(f"\n[!] Only {len(kept)} feature(s) selected: features_selected.xlsx NOT written "
-              "(PCA / clustering need at least 2). To explore anyway, try SELECT_BY = 'p' or 'top', "
-              "or ALPHA = 0.10, knowing they are less strict.")
-
-    plot_significance(res)
-    if kept:
-        plot_selected(res, feats, groups, animals, kept[:N_PLOT])
-    print(f"Results in {OUTPUT_DIR}")
-    plt.show()
-
-
-# -----------------------------------------------------------------------------
-def print_power_map(res):
-    """Grid band x (layer, state): which power features differ (any summary)."""
-    rows = []
-    for _, r in res.iterrows():
-        m = POWER_RE.match(r["feature"])
-        if m:
-            rows.append({"band": m.group(1), "where": f"{m.group(2).upper()}-{m.group(3)}",
-                         "sig": r["significant"], "ev": r["evidence"]})
-    if not rows:
-        return
-    d = pd.DataFrame(rows)
-    order = ["Delta", "Theta", "Alpha", "SlowGamma", "MidGamma", "FastGamma", "Ripple"]
-    mark = {"strong": "***", "moderate": "**", "weak": "*", "": "."}
-    rank = {"strong": 3, "moderate": 2, "weak": 1, "": 0}
-    best = (d.assign(r=d["ev"].map(rank)).groupby(["band", "where"])["r"].max()
-            .unstack().reindex([b for b in order if b in set(d["band"])]))
-    inv = {v: k for k, v in rank.items()}
-    print("\nPOWER differences by band and layer-state  (*** strong, ** moderate, * weak, . none):")
-    print(best.apply(lambda col: col.map(lambda v: mark[inv[int(v)]] if pd.notna(v) else " ")).to_string())
-
-
-def plot_significance(res):
-    col = f"{'q' if SELECT_BY == 'fdr' else 'p'}_{TEST}"
-    r = res.sort_values(["family", "feature"]).reset_index(drop=True)
-    fam_colors = {"ripple": "#7b3294", "CSD": "#e66101", "power": "#018571", "other": "gray"}
-    fig, ax = plt.subplots(figsize=(max(8, 0.16 * len(r)), 4.5))
-    ax.bar(range(len(r)), -np.log10(r[col].clip(lower=1e-12)),
-           color=[fam_colors[f] for f in r["family"]],
-           edgecolor=["k" if s else "none" for s in r["selected"]])
-    ax.axhline(-np.log10(ALPHA), color="k", ls="--", lw=1, label=f"{col.split('_')[0]} = {ALPHA}")
-    ax.set_xticks(range(len(r)), r["feature"], rotation=90, fontsize=5)
-    ax.set_ylabel(f"-log10({col.split('_')[0]})   (higher = more different)")
-    ax.set_title(f"Group differences per feature (test: {TEST}); black edge = selected")
-    present = [f for f in fam_colors if f in set(r["family"])]
-    handles = [plt.Rectangle((0, 0), 1, 1, color=fam_colors[f]) for f in present]
-    ax.legend(handles + [ax.get_lines()[0]], present + [f"threshold {ALPHA}"], fontsize=8)
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "01_significance.png", dpi=200)
-
-
-def plot_selected(res, feats, groups, animals, show):
-    ncol = min(4, len(show))
-    nrow = int(np.ceil(len(show) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 3.3 * nrow), squeeze=False)
-    rng = np.random.default_rng(0)
-    for n, f in enumerate(show):
-        ax = axes.flat[n]
-        x = feats[f].to_numpy(float)
-        for gi, g in enumerate(GROUPS):
-            m = groups == g
-            v = x[m]
-            ax.boxplot(v[~np.isnan(v)], positions=[gi], widths=0.55, showfliers=False)
-            ax.scatter(gi + rng.uniform(-0.18, 0.18, m.sum()), v, s=8, alpha=0.45,
-                       color=GROUP_COLORS[g], edgecolor="none")
-            am = pd.Series(v).groupby(animals[m]).median()      # one diamond per mouse
-            ax.scatter(np.full(len(am), gi + 0.32), am, marker="D", s=22,
-                       color=GROUP_COLORS[g], edgecolor="k", linewidth=0.5, zorder=3)
-        r = res.set_index("feature").loc[f]
-        ax.set_xticks(range(len(GROUPS)), GROUPS)
-        if r["tested_as"] == "log10":
-            ax.set_yscale("log")
-        ax.set_title(f"{f}\np = {r[f'p_{TEST}']:.2g}, q = {r[f'q_{TEST}']:.2g}", fontsize=8)
-    for ax in axes.flat[len(show):]:
-        ax.axis("off")
-    fig.suptitle("Selected features (dots = sessions, diamonds = median of each mouse)")
-    fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "02_selected_features.png", dpi=200)
+    df, pv = load()
+    print(f"KEEP_BOTH = {KEEP_BOTH} | USE_MAX = {USE_MAX} | star = Tukey p < {ALPHA} | p-values from {PVALUES_CSV.name}")
+    summary = []
+    for name in COMPARISONS_TO_RUN:
+        print("\n" + "=" * 70 + f"\n{name}\n" + "=" * 70)
+        summary.append(run_comparison(name, df, pv))
+    print("\n" + "=" * 70 + "\nSUMMARY\n" + "=" * 70)
+    print(pd.DataFrame(summary).to_string(index=False))
+    print(f"\nResults in {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

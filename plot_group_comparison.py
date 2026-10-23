@@ -11,7 +11,10 @@
 # It does NOT need the power script: it only needs three vectors of numbers per panel.
 # Run this file to make the figures from RESULTSNatalia/features_final.csv:
 #   power  -> one figure per band / layer / state, with 2 panels: Mean Power (top) and Peak Power (Max) (below)
-#   CSD    -> one figure per layer, panels Mean CSD and Median CSD
+#   CSD    -> one figure per layer, panels Mean CSD, Median CSD and Std CSD
+#             (Std CSD = how much the CSD varies from ripple to ripple within a session;
+#              its points use their own random jitter, so all the other panels and figures
+#              look exactly as they did before the Std panel was added)
 #   ripple -> one figure with frequency, amplitude and power
 #   figures      -> <baseDir>/RESULTSNatalia/group_comparison/<name>.png
 #   all p-values -> <baseDir>/RESULTSNatalia/group_comparison/group_comparison_pvalues.csv
@@ -257,7 +260,8 @@ def plot_group_comparison(WT, NPC, EFV, yLabelText, figTitle, out_file=None, rng
 # ----------------------------------------------------------------------------
 def plot_feature_figure(title, panels, layout="column", out_file=None, rng=None):
     """
-    panels: list of (panel_title, ylabel, {"WT":..., "NPC":..., "EFV":...}).
+    panels: list of (panel_title, ylabel, {"WT":..., "NPC":..., "EFV":...}) or
+            (panel_title, ylabel, values, panel_rng) to give a panel its own random jitter.
     layout: "column" (panels one under the other) or "row" (side by side).
     Returns the list of per-panel results (panel_title, p_anova, pairs, stats).
     """
@@ -268,8 +272,10 @@ def plot_feature_figure(title, panels, layout="column", out_file=None, rng=None)
     else:
         fig, axes = plt.subplots(1, n, figsize=(4.0 * n, 4.8), squeeze=False)
     out = []
-    for ax, (ptitle, ylabel, raw) in zip(axes.ravel(), panels):
-        p_an, pairs, stats = draw_panel(ax, _raw(raw["WT"], raw["NPC"], raw["EFV"]), ylabel, ptitle, rng)
+    for ax, panel in zip(axes.ravel(), panels):
+        ptitle, ylabel, raw = panel[:3]
+        prng = panel[3] if len(panel) > 3 and panel[3] is not None else rng
+        p_an, pairs, stats = draw_panel(ax, _raw(raw["WT"], raw["NPC"], raw["EFV"]), ylabel, ptitle, prng)
         out.append((ptitle, p_an, pairs, stats))
     fig.suptitle(title, fontsize=13)
     fig.tight_layout()
@@ -310,10 +316,10 @@ def build_figures(df):
         figs.append((f"{band}_{layer}_{state}", f"{BAND_NAMES.get(band, band)} Power {layer} {state}",
                      "column", panels))
 
-    # CSD: CSD_{SO|PYR|RAD|SLM}_{mean|median}
+    # CSD: CSD_{SO|PYR|RAD|SLM}_{mean|median|std}
     for layer in ("SO", "PYR", "RAD", "SLM"):
         panels = []
-        for suffix, ptitle in (("mean", "Mean CSD"), ("median", "Median CSD")):
+        for suffix, ptitle in (("mean", "Mean CSD"), ("median", "Median CSD"), ("std", "Std CSD")):
             col = f"CSD_{layer}_{suffix}"
             if col in cols:
                 panels.append((col, ptitle, "CSD (a.u.)", group_values(df, col)))
@@ -330,6 +336,10 @@ def build_figures(df):
     return figs
 
 
+def is_csd_std(feature):
+    return feature.startswith("CSD_") and feature.endswith("_std")
+
+
 def main():
     f = baseDir / TOTAL_OUT_FOLDER / FEATURES_FILE
     df = pd.read_csv(f)
@@ -342,12 +352,16 @@ def main():
     print(f"{len(df)} sessions, {len(figs)} figures")
 
     rng = np.random.default_rng(0)  # fixed seed -> same jitter every run
+    # The Std CSD panels get their OWN jitter, so adding them does not move the
+    # points of any other panel or figure.
+    std_rng = np.random.default_rng(1)
     rows = []
     for name, title, layout, panels in figs:
         panels = [p for p in panels if has_data(p[3])]
         if not panels:
             continue
-        res = plot_feature_figure(title, [(pt, yl, v) for _, pt, yl, v in panels], layout,
+        res = plot_feature_figure(title, [(pt, yl, v, std_rng if is_csd_std(feat) else None)
+                                          for feat, pt, yl, v in panels], layout,
                                   out_file=out_dir / f"{name}.png", rng=rng)
         for (feature, ptitle, _, vals), (_, p_an, pairs, stats) in zip(panels, res):
             row = {"figure": name, "feature": feature, "p_anova": p_an,
